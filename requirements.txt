@@ -1,6 +1,4 @@
 python-telegram-bot
 selenium
 webdriver-manager
-pytz
-apscheduler
-undetected-chromedriver
+schedule
