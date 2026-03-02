@@ -1,175 +1,126 @@
 import os
 import time
 import random
+import json
 import logging
-import sqlite3
-import threading
+import asyncio
 from datetime import datetime
 import pytz
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# Load environment variables
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-IST = pytz.timezone('Asia/Kolkata')
-
-# Logging setup
+# Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Database setup
-def init_db():
-    conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id INTEGER PRIMARY KEY, delay INTEGER DEFAULT 200, schedule_time TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS accounts 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, session_path TEXT)''')
-    conn.commit()
-    conn.close()
+# Config
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+IST = pytz.timezone('Asia/Kolkata')
+ACCOUNTS_FILE = "accounts.json"
 
-init_db()
+# State Storage
+user_data = {} # Stores temporary states like phone numbers during linking
+scheduler = AsyncIOScheduler(timezone=IST)
+scheduler.start()
 
-# Helper functions
-def get_user_config(user_id):
-    conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    c.execute("SELECT delay, schedule_time FROM users WHERE user_id = ?", (user_id,))
-    res = c.fetchone()
-    if not res:
-        c.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
-        conn.commit()
-        res = (200, None)
-    conn.close()
-    return res
+def load_accounts():
+    if os.path.exists(ACCOUNTS_FILE):
+        with open(ACCOUNTS_FILE, "r") as f: return json.load(f)
+    return {}
 
-def get_accounts(user_id):
-    conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    c.execute("SELECT phone FROM accounts WHERE user_id = ?", (user_id,))
-    res = [row[0] for row in c.fetchall()]
-    conn.close()
-    return res
+def save_accounts(data):
+    with open(ACCOUNTS_FILE, "w") as f: json.dump(data, f)
 
-# Command Handlers
+# --- Browser Logic ---
+def get_driver(account_id):
+    options = Options()
+    options.add_argument("--headless") # Required for hosting
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    # Separate profile for each account
+    profile_path = os.path.join(os.getcwd(), "profiles", f"account_{account_id}")
+    options.add_argument(f"--user-data-dir={profile_path}")
+    
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    return driver
+
+async def link_account_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, phone: str):
+    account_id = str(random.randint(1000, 9999))
+    driver = get_driver(account_id)
+    driver.get("https://web.whatsapp.com")
+    
+    try:
+        # Click "Link with phone number instead"
+        wait = WebDriverWait(driver, 30)
+        link_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Link with phone number')]")))
+        link_btn.click()
+        
+        # Input phone number
+        phone_input = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='text']")))
+        phone_input.send_keys(phone)
+        
+        next_btn = driver.find_element(By.XPATH, "//*[contains(text(), 'Next')]")
+        next_btn.click()
+        
+        # Scrape 8-digit code
+        code_elements = wait.until(EC.presence_of_all_elements_located((By.XPATH, "//div[@aria-details='pairing-code']//span")))
+        pairing_code = "".join([el.text for el in code_elements])
+        
+        await update.message.reply_text(f"✅ Code Generated!\nEnter this on your phone: `{pairing_code}`", parse_mode="Markdown")
+        
+        # Save account reference
+        accounts = load_accounts()
+        accounts[account_id] = {"phone": phone, "linked": False, "delay": 250}
+        save_accounts(accounts)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error during linking: {str(e)}")
+    finally:
+        driver.quit()
+
+# --- Telegram Bot Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("➕ Add Account", callback_data='add_account'),
-         InlineKeyboardButton("📜 List Accounts", callback_data='list_accounts')],
-        [InlineKeyboardButton("🕒 Set Delay", callback_data='set_delay'),
-         InlineKeyboardButton("📅 Schedule", callback_data='set_schedule')],
-        [InlineKeyboardButton("🚀 Start Messaging", callback_data='start_messaging'),
-         InlineKeyboardButton("🛑 Stop", callback_data='stop_messaging')],
-        [InlineKeyboardButton("🚪 Logout", callback_data='logout')]
+        [InlineKeyboardButton("➕ Add Account", callback_query_data="add")],
+        [InlineKeyboardButton("📜 List Accounts", callback_query_data="list")],
+        [InlineKeyboardButton("⚙️ Schedule & Delay", callback_query_data="settings")],
+        [InlineKeyboardButton("🚀 Start Messaging", callback_query_data="start_msg"), InlineKeyboardButton("🛑 Stop", callback_query_data="stop")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    welcome_text = (
-        "👋 *Welcome to WhatsApp Multi-Account Manager!*\n\n"
-        "This bot helps you link multiple WhatsApp accounts and automate messaging between them safely.\n\n"
-        "✨ *Features:*\n"
-        "• Link via Pairing Code (No QR needed)\n"
-        "• Anti-Ban Delays (200-300s default)\n"
-        "• IST Scheduling\n"
-        "• Two-way automated messaging\n\n"
-        "Use the buttons below to get started!"
-    )
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text("👋 *Welcome to Multi-WA Bot*\nLink your accounts using pairing codes and schedule automated 2-way messaging.", reply_markup=reply_markup, parse_mode="Markdown")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'add_account':
-        await query.edit_message_text("📱 Please send the phone number with country code (e.g., +919876543210):")
-        context.user_data['state'] = 'AWAITING_PHONE'
-        
-    elif query.data == 'list_accounts':
-        accounts = get_accounts(query.from_user.id)
-        if not accounts:
-            await query.edit_message_text("❌ No accounts linked yet.")
-        else:
-            text = "✅ *Linked Accounts:*\n" + "\n".join([f"• {a}" for a in accounts])
-            await query.edit_message_text(text, parse_mode='Markdown')
-            
-    elif query.data == 'set_delay':
-        delay, _ = get_user_config(query.from_user.id)
-        await query.edit_message_text(f"⏱ Current delay: {delay}s\nSend a new value (min 200s):")
-        context.user_data['state'] = 'AWAITING_DELAY'
+    if query.data == "add":
+        await query.message.reply_text("Please send your phone number with country code (e.g., +919876543210):")
+        context.user_data['state'] = 'awaiting_phone'
+    elif query.data == "list":
+        accounts = load_accounts()
+        text = "Linked Accounts:\n" + "\n".join([f"ID: {id} | {acc['phone']}" for id, acc in accounts.items()])
+        await query.message.reply_text(text or "No accounts linked.")
 
-    elif query.data == 'set_schedule':
-        _, schedule = get_user_config(query.from_user.id)
-        await query.edit_message_text(f"📅 Current schedule: {schedule or 'Not set'}\nSend time in HH:MM (IST, 24h format):")
-        context.user_data['state'] = 'AWAITING_SCHEDULE'
-
-    elif query.data == 'start_messaging':
-        # Logic to start background thread for messaging
-        await query.edit_message_text("🚀 Messaging process started in background!")
-        
-    elif query.data == 'stop_messaging':
-        await query.edit_message_text("🛑 Messaging process stopped.")
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def message_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
-    user_id = update.effective_user.id
-    text = update.message.text
-
-    if state == 'AWAITING_PHONE':
-        # Here we would trigger the Selenium pairing process
-        await update.message.reply_text(f"⏳ Initializing WhatsApp Web for {text}...\nGenerating pairing code...")
-        # Mocking code generation for now
-        pairing_code = "ABCD-1234" 
-        await update.message.reply_text(f"🔑 Your Pairing Code: `{pairing_code}`\n\nEnter this on your phone in WhatsApp > Linked Devices > Link with Phone Number.", parse_mode='Markdown')
-        
-        # Save to DB
-        conn = sqlite3.connect('bot_data.db')
-        c = conn.cursor()
-        c.execute("INSERT INTO accounts (user_id, phone) VALUES (?, ?)", (user_id, text))
-        conn.commit()
-        conn.close()
+    if state == 'awaiting_phone':
+        phone = update.message.text
+        await update.message.reply_text(f"⏳ Opening WhatsApp Web for {phone}...")
+        asyncio.create_task(link_account_logic(update, context, phone))
         context.user_data['state'] = None
 
-    elif state == 'AWAITING_DELAY':
-        try:
-            val = int(text)
-            if val < 200:
-                await update.message.reply_text("⚠️ Minimum delay is 200s for safety.")
-                return
-            conn = sqlite3.connect('bot_data.db')
-            c = conn.cursor()
-            c.execute("UPDATE users SET delay = ? WHERE user_id = ?", (val, user_id))
-            conn.commit()
-            conn.close()
-            await update.message.reply_text(f"✅ Delay updated to {val}s.")
-            context.user_data['state'] = None
-        except ValueError:
-            await update.message.reply_text("❌ Please send a valid number.")
-
-    elif state == 'AWAITING_SCHEDULE':
-        # Validate HH:MM
-        try:
-            datetime.strptime(text, "%H:%M")
-            conn = sqlite3.connect('bot_data.db')
-            c = conn.cursor()
-            c.execute("UPDATE users SET schedule_time = ? WHERE user_id = ?", (text, user_id))
-            conn.commit()
-            conn.close()
-            await update.message.reply_text(f"✅ Schedule set for {text} IST.")
-            context.user_data['state'] = None
-        except ValueError:
-            await update.message.reply_text("❌ Invalid format. Use HH:MM (e.g., 14:30).")
-
-if __name__ == '__main__':
-    if not TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN not found in environment.")
-        exit(1)
-        
+# --- Main Logic Execution ---
+if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
-    
-    print("Bot is running...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_received))
     app.run_polling()
