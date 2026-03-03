@@ -1,0 +1,5 @@
+{
+  "name": "WhatsApp Multi-Account Manager Bot",
+  "description": "A Telegram bot to link multiple WhatsApp accounts via pairing codes, schedule automated two-way messaging, and manage communication delays to prevent bans.",
+  "requestFramePermissions": []
+}

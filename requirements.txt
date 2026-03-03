@@ -1,0 +1,16 @@
+telegraf
+@whiskeysockets/baileys
+pino
+node-cron
+better-sqlite3
+libsignal-node
+@adiwajshing/keyed-db
+express
+vite
+@tailwindcss/vite
+@vitejs/plugin-react
+tsx
+typescript
+lucide-react
+motion
+@hapi/boom
